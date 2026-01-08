@@ -3,7 +3,8 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
 
-dotenv.config();
+const path = require('path');
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -28,7 +29,6 @@ if (process.env.DATABASE_URL) {
     ssl: {
       rejectUnauthorized: false,
     },
-    family: 4,
   });
   console.log('Using Supabase PostgreSQL');
 } else {
@@ -54,8 +54,41 @@ app.get('/api/health', (req, res) => {
 
 
 // Initialize Database
+// Initialize Database
 const initDb = async () => {
   try {
+    // Create Users Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGINT PRIMARY KEY,
+        name VARCHAR(255),
+        email VARCHAR(255) UNIQUE,
+        password VARCHAR(255),
+        role VARCHAR(50)
+      );
+    `);
+
+    // Ensure columns exist (Migration fix)
+    try {
+      await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255)');
+      await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(50)');
+      await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255)');
+
+      // Fix ID type mismatch (Integer vs BigInt)
+      await pool.query('ALTER TABLE users ALTER COLUMN id TYPE BIGINT');
+      await pool.query('ALTER TABLE requests ALTER COLUMN id TYPE BIGINT');
+
+      // Fix Legacy Constraints (Supabase/Previous Schema)
+      try {
+        await pool.query('ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL');
+      } catch (e) { /* Ignore if column doesn't exist */ }
+
+      console.log('Verified user schema columns and types');
+    } catch (e) {
+      console.log('Schema verification note:', e.message);
+    }
+
+    // Create Requests Table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS requests (
         id BIGINT PRIMARY KEY,
@@ -73,7 +106,7 @@ const initDb = async () => {
         spot_id VARCHAR(50)
       );
     `);
-    console.log('Database initialized: requests table ready');
+    console.log('Database initialized: users and requests tables ready');
   } catch (err) {
     console.error('Error initializing database:', err);
   }
@@ -81,6 +114,34 @@ const initDb = async () => {
 initDb();
 
 // API Endpoints
+// Auth
+app.post('/api/auth/signup', async (req, res) => {
+  const { name, email, password, role } = req.body;
+  const id = Date.now(); // Simple ID gen
+  try {
+    const query = `INSERT INTO users (id, name, email, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING *`;
+    const result = await pool.query(query, [id, name, email, password, role || 'user']);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    if (err.code === '23505') return res.status(400).json({ error: 'User already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1 AND password = $2', [email, password]);
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.status(401).json({ error: 'Invalid credentials' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
 
 // GET all requests
 app.get('/api/requests', async (req, res) => {
